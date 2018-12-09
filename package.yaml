@@ -20,10 +20,17 @@ ghc-options:
 
 dependencies:
   - base >= 4.7 && < 5
+  - flow
 
 library:
   source-dirs:        src
-  dependencies:       []
+  dependencies:
+    - aeson
+    - servant
+    - servant-server
+    - text
+    - time
+    - wai
 
 executables:
   fic-wordpress:
@@ -31,3 +38,4 @@ executables:
     main:             Main.hs
     dependencies:
       - fic-wordpress
+      - warp
