@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 module Main where
 
 import           Control.Monad.IO.Class         ( liftIO )
@@ -19,12 +20,21 @@ import           Api                            ( Config(..)
                                                 , app
                                                 )
 
+import qualified Data.Text                     as T
+
+
+-- TODO: read config file instead of env var
 main :: IO ()
 main = do
     dbPass <- getEnv "DB_PASS"
     let dbInfo = defaultConnectInfo { connectDatabase = "fic_wp"
                                     , connectPassword = dbPass
                                     }
-    runStderrLoggingT $ withMySQLPool dbInfo 20 $ \pool ->
-        liftIO $ runSettings settings <. app <| Config pool
-    where settings = defaultSettings |> setPort 8080 |> setHost "*"
+    wpSiteUrl      <- textEnv "SITE_URL"
+    wpLoggedInKey  <- textEnv "LOGGED_IN_KEY"
+    wpLoggedInSalt <- textEnv "LOGGED_IN_SALT"
+    runStderrLoggingT $ withMySQLPool dbInfo 20 $ \dbPool ->
+        liftIO <. runSettings settings <| app Config { .. }
+  where
+    settings = defaultSettings |> setPort 8080 |> setHost "*"
+    textEnv  = fmap T.pack . getEnv

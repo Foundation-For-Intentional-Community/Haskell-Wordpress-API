@@ -22,18 +22,25 @@ dependencies:
   - base >= 4.7 && < 5
   - flow
   - mtl
+  - text
 
 library:
   source-dirs:        src
   dependencies:
     - aeson
+    - base16-bytestring
+    - bytestring
+    - cookie
+    - cryptohash-md5
+    - cryptohash-sha256
+    - hs-php-session
     - persistent
     - persistent-template
     - resource-pool
     - servant
     - servant-server
-    - text
     - time
+    - uri-encode
     - wai
 
 executables:

@@ -1,66 +1,105 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeOperators #-}
+{- | This module specifies the API types/routes & exports a Wai
+Application to serve it.
+-}
 module Api
     ( Config(..)
     , app
     )
 where
 
-import           Control.Monad.Reader           ( ReaderT
-                                                , runReaderT
-                                                , asks
-                                                )
+import           Control.Monad.Reader           ( runReaderT )
 import           Data.Aeson                     ( ToJSON )
-import           Data.Pool                      ( Pool
-                                                , withResource
-                                                )
+import           Data.Maybe                     ( fromMaybe )
 import           Data.Proxy                     ( Proxy(..) )
 import           Data.Text                      ( Text )
 import           Database.Persist.Sql           ( (==.)
-                                                , SqlBackend
                                                 , Entity(..)
                                                 , selectList
+                                                , selectFirst
                                                 , fromSqlKey
                                                 )
---import           Data.Time                      ( UTCTime )
+import           Flow
 import           GHC.Generics                   ( Generic )
-import           Network.Wai                    ( Application )
+import           Network.Wai                    ( Application
+                                                , Request
+                                                )
 import           Servant                        ( (:>)
+                                                , (:<|>)(..)
+                                                , AuthProtect
                                                 , Get
-                                                , Handler
                                                 , JSON
                                                 , Server
                                                 , ServerT
-                                                , serve
-                                                , hoistServer
+                                                , Context(..)
+                                                , serveWithContext
+                                                , hoistServerWithContext
                                                 )
+import           Servant.Server.Experimental.Auth
+                                                ( AuthHandler )
 
 import           Schema
+import           Types
+import           WordpressAuth
 
+
+-- | Create an API Server with the Given Configuration.
 app :: Config -> Application
-app c = serve api $ server c
+app c = serveWithContext api (serverContext c) (server c)
 
 server :: Config -> Server API
-server c = hoistServer api (`runReaderT` c) routes
+server c = hoistServerWithContext api context (`runReaderT` c) routes
+
+serverContext :: Config -> Context (AuthHandler Request WordpressUserId ': '[])
+serverContext config = authHandler (wordpressConfig config) :. EmptyContext
+
+wordpressConfig :: Config -> WordpressAuthConfig
+wordpressConfig c = WordpressAuthConfig
+    { cookieName   = defaultCookieName $ wpSiteUrl c
+    , getUserData  = fetchUserData
+    , loggedInKey  = wpLoggedInKey c
+    , loggedInSalt = wpLoggedInSalt c
+    }
+  where
+    fetchUserData userName = flip runReaderT c $ do
+        maybeUser <- runDB $ selectFirst [UserLogin ==. userName] []
+        case maybeUser of
+            Just e  -> Just <$> getSessionTokens e
+            Nothing -> return Nothing
+    getSessionTokens (Entity userId user) = do
+        tokenMeta <- runDB $ selectFirst
+            [UserMetaUser ==. userId, UserMetaKey ==. "session_tokens"]
+            []
+        return
+            ( fromIntegral $ fromSqlKey userId
+            , userPassword user
+            , maybe [] metaToTokenList tokenMeta
+            )
+      where
+        metaToTokenList =
+            entityVal .> userMetaValue .> fromMaybe "" .> decodeSessionTokens
+
+
+context :: Proxy '[AuthHandler Request WordpressUserId]
+context = Proxy
+
+
 
 api :: Proxy API
 api = Proxy
 
+-- brittany-disable-next-binding
 type API =
-    "directory" :>
-        "entries" :> Get '[JSON] [CommunityListing]
+         "directory" :> "entries"
+                     :> Get '[JSON] [CommunityListing]
+    :<|> "private" :> AuthProtect "wordpress"
+                   :> Get '[JSON] [CommunityListing]
 
 routes :: ServerT API AppM
-routes = getListings
-
-type AppM = ReaderT Config Handler
-newtype Config = Config { dbPool :: Pool SqlBackend }
-
-runDB :: ReaderT SqlBackend AppM a -> AppM a
-runDB m = do
-    pool <- asks dbPool
-    withResource pool $ runReaderT m
+routes = getListings :<|> const getListings
 
 data CommunityListing
     = CommunityListing

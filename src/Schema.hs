@@ -22,6 +22,7 @@ share [mkPersist sqlSettings] [persistLowerCase|
 User sql=3uOgy46w_users
     Id sql=ID
     login Text sql=user_login
+    password Text sql=user_pass
     nicename Text sql=user_nicename
     email Text sql=user_email
     displayName Text sql=display_name
