@@ -3,8 +3,8 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
-{-# LANGUAGE TypeFamilies #-}
 {- | This module presents a Servant AuthHandler that validates a LOGGED_IN
 Wordpress Cookie.
 
@@ -12,13 +12,18 @@ It validates the token hash using the server-side key & salt values, as
 well as the User's session Token.
 
 In order to use this, you must build a `WordpressAuthConfig`, which defines
-your cookie name, auth key/salt, and a function to fetch the ID, Password
-Hash, & Session Tokens for a User via their `user_login` field.
+your cookie name, auth key/salt, and a function to fetch the Password Hash,
+Session Tokens, & other data for a User via their `user_login` field.
+
+Upon successful authentication, the other data will be returned. Typically
+this would be your User type or the User's ID.
+
+You must define the create `ServerData` type instance yourself:
+
+> type instance AuthServerData (AuthProtect "wp") = WordpressUesrData (Entity User)
+
 
 TODO: Validate the REST nonce as well
-TODO: We don't actually need the user id in the code, it's just what
-      wordpress returns. We could let the user return any type(preventing
-      double user queries).
 TODO: Optional AuthHandler that wraps in Maybe & doesn't throw errors.
       May be able to implement this w/ custom return type & onFailure
       function.
@@ -28,7 +33,7 @@ TODO: Implement `auth` & `auth_sec` schemes for wp-admin? Both the
 -}
 module WordpressAuth
     ( authHandler
-    , WordpressUserId(..)
+    , WordpressUserData(..)
     , WordpressAuthConfig(..)
     , CookieName(..)
     , defaultCookieName
@@ -55,15 +60,13 @@ import           Network.URI.Encode             ( decodeText )
 import           Network.Wai                    ( Request
                                                 , requestHeaders
                                                 )
-import           Servant                        ( AuthProtect
-                                                , Handler
+import           Servant                        ( Handler
                                                 , errBody
                                                 , err401
                                                 , throwError
                                                 )
 import           Servant.Server.Experimental.Auth
-                                                ( AuthServerData
-                                                , AuthHandler
+                                                ( AuthHandler
                                                 , mkAuthHandler
                                                 )
 import           Text.Read                      ( readMaybe )
@@ -77,19 +80,21 @@ import qualified Data.ByteString.Lazy          as LBS
 import qualified Data.Text                     as T
 
 
--- | The User ID Returned by Auth Verification.
-newtype WordpressUserId = WordpressUserId { unWordpressUserId :: Integer }
+-- | This represents some arbitrary data passed to your route on successful
+-- authentication, e.g. your User model or the user's ID.
+newtype WordpressUserData a = WordpressUserData { wordpressUserData :: a }
 
-type instance AuthServerData (AuthProtect "wordpress") = WordpressUserId
 
-
--- | Expect the `wordpress_logged_in_` Cookie, returning the User ID if it
--- is valid, or throwing an
--- TODO refactor different errors into type & have onFailure func in wpconfig
-authHandler :: WordpressAuthConfig -> AuthHandler Request WordpressUserId
+-- | Expect Wordpress's `LOGGED_IN_COOKIE`, returning the UserData if it is
+-- valid, or throwing a 401 error otherwise.
+-- TODO: refactor different errors into type & have onFailure func in wpconfig
+authHandler
+    :: forall u
+     . WordpressAuthConfig u
+    -> AuthHandler Request (WordpressUserData u)
 authHandler wpConfig = mkAuthHandler handler
   where
-    handler :: Request -> Handler WordpressUserId
+    handler :: Request -> Handler (WordpressUserData u)
     handler req =
         let maybeCookie =
                     lookup "cookie" (requestHeaders req)
@@ -132,26 +137,26 @@ parseWordpressCookie rawCookie = case T.splitOn "|" rawCookie of
 -- | Validate the Hash & Token in the Cookie, returning the User ID or
 -- throwing a 401 error.
 validateWordpressCookie
-    :: WordpressAuthConfig -> WPCookie -> Handler WordpressUserId
+    :: WordpressAuthConfig a -> WPCookie -> Handler (WordpressUserData a)
 validateWordpressCookie wpConfig wpCookie = do
     currentTime <- liftIO getPOSIXTime
     if currentTime > expiration wpCookie
         then authError
         else (username wpCookie |> getUserData wpConfig) >>= \case
             Nothing -> authError
-            Just (userId, userPass, sessionTokens) -> do
+            Just (userData, userPass, sessionTokens) -> do
                 let validHash = validateHash wpConfig wpCookie userPass
                     validSessionToken =
                         validateSessionToken currentTime wpCookie sessionTokens
                 if validHash && validSessionToken
-                    then return $ WordpressUserId userId
+                    then return $ WordpressUserData userData
                     else authError
   where
     authError :: Handler a
     authError = throwError $ err401 { errBody = "Invalid Cookie" }
 
 -- | Ensure the Cookie's hash matches the salted & hashed password & token.
-validateHash :: WordpressAuthConfig -> WPCookie -> Text -> Bool
+validateHash :: WordpressAuthConfig a -> WPCookie -> Text -> Bool
 validateHash wpConfig wpCookie userPass =
     let passFragment = T.drop 8 userPass |> T.take 4
         key =
@@ -187,13 +192,13 @@ validateSessionToken currentTime wpCookie sessionTokens =
 
 -- | Port of wp_hash function. The returned Text is a hex representation of
 -- an MD5 HMAC with loggedInKey & loggedInSalt.
-wordpressHash :: WordpressAuthConfig -> Text -> Text
+wordpressHash :: WordpressAuthConfig a -> Text -> Text
 wordpressHash wpConfig textToHash =
     let salt = wordpressSalt wpConfig in hmacText MD5.hmac salt textToHash
 
 -- | Port of wp_salt function. Builds the salt for the logged_in auth
 -- scheme by concatenating the key & salt.
-wordpressSalt :: WordpressAuthConfig -> Text
+wordpressSalt :: WordpressAuthConfig a -> Text
 wordpressSalt WordpressAuthConfig { loggedInKey, loggedInSalt } =
     loggedInKey <> loggedInSalt
 
@@ -244,7 +249,7 @@ hashText hasher = encodeUtf8 .> hasher .> Base16.encode .> decodeUtf8
 -- Auth Configuration
 
 -- | The Configuration Options for the Authentication Validation
-data WordpressAuthConfig
+data WordpressAuthConfig a
     = WordpressAuthConfig
         { cookieName :: CookieName
         -- ^ The Name of the Cookie to Check
@@ -252,7 +257,7 @@ data WordpressAuthConfig
         -- ^ The LOGGED_IN_KEY from wp-config.php
         , loggedInSalt :: Text
         -- ^ The LOGGED_IN_SALT from wp-config.php
-        , getUserData :: Text -> Handler (Maybe (Integer, Text, [(Text, POSIXTime)]))
+        , getUserData :: Text -> Handler (Maybe (a, Text, [(Text, POSIXTime)]))
         -- ^ Function for fetching the User's ID, Password, & Session
         -- Tokens from their `user_login`.
         }

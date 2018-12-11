@@ -1,6 +1,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {- | This module specifies the API types/routes & exports a Wai
 Application to serve it.
@@ -39,7 +40,9 @@ import           Servant                        ( (:>)
                                                 , hoistServerWithContext
                                                 )
 import           Servant.Server.Experimental.Auth
-                                                ( AuthHandler )
+                                                ( AuthHandler
+                                                , AuthServerData
+                                                )
 
 import           Schema
 import           Types
@@ -53,10 +56,15 @@ app c = serveWithContext api (serverContext c) (server c)
 server :: Config -> Server API
 server c = hoistServerWithContext api context (`runReaderT` c) routes
 
-serverContext :: Config -> Context (AuthHandler Request WordpressUserId ': '[])
+serverContext
+    :: Config
+    -> Context (AuthHandler Request (WordpressUserData (Entity User)) ': '[])
 serverContext config = authHandler (wordpressConfig config) :. EmptyContext
 
-wordpressConfig :: Config -> WordpressAuthConfig
+type instance AuthServerData (AuthProtect "wordpress") = WordpressUserData (Entity User)
+
+
+wordpressConfig :: Config -> WordpressAuthConfig (Entity User)
 wordpressConfig c = WordpressAuthConfig
     { cookieName   = defaultCookieName $ wpSiteUrl c
     , getUserData  = fetchUserData
@@ -69,21 +77,17 @@ wordpressConfig c = WordpressAuthConfig
         case maybeUser of
             Just e  -> Just <$> getSessionTokens e
             Nothing -> return Nothing
-    getSessionTokens (Entity userId user) = do
+    getSessionTokens e@(Entity userId user) = do
         tokenMeta <- runDB $ selectFirst
             [UserMetaUser ==. userId, UserMetaKey ==. "session_tokens"]
             []
-        return
-            ( fromIntegral $ fromSqlKey userId
-            , userPassword user
-            , maybe [] metaToTokenList tokenMeta
-            )
+        return (e, userPassword user, maybe [] metaToTokenList tokenMeta)
       where
         metaToTokenList =
             entityVal .> userMetaValue .> fromMaybe "" .> decodeSessionTokens
 
 
-context :: Proxy '[AuthHandler Request WordpressUserId]
+context :: Proxy '[AuthHandler Request (WordpressUserData (Entity User))]
 context = Proxy
 
 
