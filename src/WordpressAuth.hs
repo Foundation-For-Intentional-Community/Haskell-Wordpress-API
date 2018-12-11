@@ -30,6 +30,9 @@ TODO: Optional AuthHandler that wraps in Maybe & doesn't throw errors.
 TODO: Implement `auth` & `auth_sec` schemes for wp-admin? Both the
       logged_in & auth/auth_sec cookies are sent in admin requests. Do
       admin routes check both or something? Ask in #wordpress
+TODO: Allow dynamic generation of CookieName by replacing WPConfig field w/
+      `IO CookieName`. This would allow querying the database for the
+      siteurl instead of hardcoding it.
 -}
 module WordpressAuth
     ( authHandler
@@ -79,6 +82,20 @@ import qualified Data.ByteString.Base16        as Base16
 import qualified Data.ByteString.Lazy          as LBS
 import qualified Data.Text                     as T
 
+
+-- | The Configuration Options for the Authentication Validation
+data WordpressAuthConfig a
+    = WordpressAuthConfig
+        { cookieName :: CookieName
+        -- ^ The Name of the Cookie to Check
+        , loggedInKey :: Text
+        -- ^ The LOGGED_IN_KEY from wp-config.php
+        , loggedInSalt :: Text
+        -- ^ The LOGGED_IN_SALT from wp-config.php
+        , getUserData :: Text -> Handler (Maybe (a, Text, [(Text, POSIXTime)]))
+        -- ^ Function for fetching the User's ID, Password, & Session
+        -- Tokens from their `user_login`.
+        }
 
 -- | This represents some arbitrary data passed to your route on successful
 -- authentication, e.g. your User model or the user's ID.
@@ -248,23 +265,7 @@ hashText hasher = encodeUtf8 .> hasher .> Base16.encode .> decodeUtf8
 
 -- Auth Configuration
 
--- | The Configuration Options for the Authentication Validation
-data WordpressAuthConfig a
-    = WordpressAuthConfig
-        { cookieName :: CookieName
-        -- ^ The Name of the Cookie to Check
-        , loggedInKey :: Text
-        -- ^ The LOGGED_IN_KEY from wp-config.php
-        , loggedInSalt :: Text
-        -- ^ The LOGGED_IN_SALT from wp-config.php
-        , getUserData :: Text -> Handler (Maybe (a, Text, [(Text, POSIXTime)]))
-        -- ^ Function for fetching the User's ID, Password, & Session
-        -- Tokens from their `user_login`.
-        }
-
 -- | Represents the name of Wordpress's `LOGGED_IN` Cookie.
--- TODO: WithMD5 should have monadic value to pull from, so people can
--- generically write their siteurl option fetching for any DB library.
 data CookieName
     = CustomCookieName Text
     -- ^ Use the fixed name for the Cookie.
