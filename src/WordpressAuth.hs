@@ -24,26 +24,34 @@ You must define the create `ServerData` type instance yourself:
 
 
 TODO: Validate the REST nonce as well
-TODO: Optional AuthHandler that wraps in Maybe & doesn't throw errors.
-      May be able to implement this w/ custom return type & onFailure
-      function.
 TODO: Implement `auth` & `auth_sec` schemes for wp-admin? Both the
       logged_in & auth/auth_sec cookies are sent in admin requests. Do
       admin routes check both or something? Ask in #wordpress
 TODO: Allow dynamic generation of CookieName by replacing WPConfig field w/
-      `IO CookieName`. This would allow querying the database for the
-      siteurl instead of hardcoding it.
+      `IO CookieName` or `Handler CookieName`. This would allow querying
+      the database for the siteurl instead of hardcoding it.
 -}
 module WordpressAuth
-    ( authHandler
+    ( WordpressAuthConfig(..)
     , WordpressUserData(..)
-    , WordpressAuthConfig(..)
+    , WordpressAuthError(..)
+    , authHandler
     , CookieName(..)
     , defaultCookieName
     , decodeSessionTokens
     )
 where
 
+import           Control.Monad                  ( (<=<)
+                                                , unless
+                                                )
+import           Control.Monad.Except           ( MonadError
+                                                , ExceptT
+                                                , runExceptT
+                                                , throwError
+                                                , liftEither
+                                                , lift
+                                                )
 import           Control.Monad.Reader           ( liftIO )
 import           Data.Maybe                     ( mapMaybe
                                                 , isJust
@@ -63,11 +71,7 @@ import           Network.URI.Encode             ( decodeText )
 import           Network.Wai                    ( Request
                                                 , requestHeaders
                                                 )
-import           Servant                        ( Handler
-                                                , errBody
-                                                , err401
-                                                , throwError
-                                                )
+import           Servant                        ( Handler )
 import           Servant.Server.Experimental.Auth
                                                 ( AuthHandler
                                                 , mkAuthHandler
@@ -87,24 +91,43 @@ import qualified Data.Text                     as T
 data WordpressAuthConfig a
     = WordpressAuthConfig
         { cookieName :: CookieName
-        -- ^ The Name of the Cookie to Check
+        -- ^ The Name of the Cookie to check
         , loggedInKey :: Text
         -- ^ The LOGGED_IN_KEY from wp-config.php
         , loggedInSalt :: Text
         -- ^ The LOGGED_IN_SALT from wp-config.php
         , getUserData :: Text -> Handler (Maybe (a, Text, [(Text, POSIXTime)]))
-        -- ^ Function for fetching the User's ID, Password, & Session
-        -- Tokens from their `user_login`.
+        -- ^ Function for fetching the User's Data, Password, & Session
+        -- Tokens from the `user_login` in the Cookie.
+        , onAuthenticationFailure :: WordpressAuthError -> Handler (WordpressUserData a)
+        -- ^ Function to run when authentication validation fails.
         }
 
 -- | This represents some arbitrary data passed to your route on successful
 -- authentication, e.g. your User model or the user's ID.
+-- TODO: Do we really need this wrapper type?
 newtype WordpressUserData a = WordpressUserData { wordpressUserData :: a }
+
+-- | Potential errors that may occur during authentication.
+data WordpressAuthError
+    = NoCookieHeader
+    -- ^ The `Request` has no `Cookie` header.
+    | NoCookieMatches
+    -- ^ No Cookie matched the expected `CookieName`.
+    | CookieParsingFailed
+    -- ^ We couldn't decode the Cookie's text.
+    | CookieExpired
+    -- ^ The expiration time of the Cookie is in the past.
+    | UserDataNotFound
+    -- ^ The getUserData function returned Nothing.
+    | InvalidHash
+    -- ^ The HMAC hash in the Cookie couldn't be validated.
+    | InvalidToken
+    -- ^ The session token in the Cookie couldn't be validated.
 
 
 -- | Expect Wordpress's `LOGGED_IN_COOKIE`, returning the UserData if it is
 -- valid, or throwing a 401 error otherwise.
--- TODO: refactor different errors into type & have onFailure func in wpconfig
 authHandler
     :: forall u
      . WordpressAuthConfig u
@@ -113,21 +136,21 @@ authHandler wpConfig = mkAuthHandler handler
   where
     handler :: Request -> Handler (WordpressUserData u)
     handler req =
-        let maybeCookie =
-                    lookup "cookie" (requestHeaders req)
-                        >>= parseCookiesText
-                        .>  lookup (fromCookieName $ cookieName wpConfig)
-                        .>  fmap decodeText
-        in  case maybeCookie of
-                Nothing -> authError "Missing Cookie"
-                Just rawCookieText ->
-                    case parseWordpressCookie rawCookieText of
-                        Nothing -> authError "Malformed Cookie"
-                        Just wpCookie ->
-                            validateWordpressCookie wpConfig wpCookie
-
-    authError :: LBS.ByteString -> Handler a
-    authError e = throwError $ err401 { errBody = e }
+        either (onAuthenticationFailure wpConfig) return <=< runExceptT $ do
+            cookieHeader <- lookup "cookie" (requestHeaders req)
+                |> liftMaybe NoCookieHeader
+            cookieText <-
+                parseCookiesText cookieHeader
+                |> lookup (fromCookieName $ cookieName wpConfig)
+                |> fmap decodeText
+                |> liftMaybe NoCookieMatches
+            wpCookie <- parseWordpressCookie cookieText
+                |> liftMaybe CookieParsingFailed
+            validateWordpressCookie wpConfig wpCookie
+    liftMaybe :: MonadError e m => e -> Maybe a -> m a
+    liftMaybe a = liftEither . maybeToEither a
+    maybeToEither :: e -> Maybe a -> Either e a
+    maybeToEither e = maybe (Left e) Right
 
 
 -- Parsing / Validation
@@ -142,7 +165,6 @@ data WPCookie
     deriving (Show)
 
 -- | Parse the Cookie content into a `WPCookie`.
--- TODO: Use either for better error msg
 parseWordpressCookie :: Text -> Maybe WPCookie
 parseWordpressCookie rawCookie = case T.splitOn "|" rawCookie of
     [username, expiration_, token, hmac] ->
@@ -151,26 +173,25 @@ parseWordpressCookie rawCookie = case T.splitOn "|" rawCookie of
             Nothing         -> Nothing
     _ -> Nothing
 
--- | Validate the Hash & Token in the Cookie, returning the User ID or
--- throwing a 401 error.
+-- | Validate the Hash & Token in the Cookie, returning the User Data or
+-- throwing a WordpressAutherror.
 validateWordpressCookie
-    :: WordpressAuthConfig a -> WPCookie -> Handler (WordpressUserData a)
+    :: WordpressAuthConfig a
+    -> WPCookie
+    -> ExceptT WordpressAuthError Handler (WordpressUserData a)
 validateWordpressCookie wpConfig wpCookie = do
     currentTime <- liftIO getPOSIXTime
     if currentTime > expiration wpCookie
-        then authError
-        else (username wpCookie |> getUserData wpConfig) >>= \case
-            Nothing -> authError
+        then throwError CookieExpired
+        else (username wpCookie |> getUserData wpConfig .> lift) >>= \case
+            Nothing -> throwError UserDataNotFound
             Just (userData, userPass, sessionTokens) -> do
                 let validHash = validateHash wpConfig wpCookie userPass
                     validSessionToken =
                         validateSessionToken currentTime wpCookie sessionTokens
-                if validHash && validSessionToken
-                    then return $ WordpressUserData userData
-                    else authError
-  where
-    authError :: Handler a
-    authError = throwError $ err401 { errBody = "Invalid Cookie" }
+                unless validHash $ throwError InvalidHash
+                unless validSessionToken $ throwError InvalidToken
+                return $ WordpressUserData userData
 
 -- | Ensure the Cookie's hash matches the salted & hashed password & token.
 validateHash :: WordpressAuthConfig a -> WPCookie -> Text -> Bool
