@@ -80,7 +80,7 @@ type instance AuthServerData (AuthProtect "wordpress-optional") = WordpressUserD
 wordpressConfig :: Config -> WordpressAuthConfig (Entity User)
 wordpressConfig c = WordpressAuthConfig
     { cookieName              = defaultCookieName $ wpSiteUrl c
-    , getUserData             = fetchUserData c
+    , getUserData             = fetchUserData
     , loggedInKey             = wpLoggedInKey c
     , loggedInSalt            = wpLoggedInSalt c
     , onAuthenticationFailure = replyWith401
@@ -93,26 +93,13 @@ wordpressConfig c = WordpressAuthConfig
         NoCookieMatches     -> "Missing Cookie"
         CookieParsingFailed -> "Malformed Cookie"
         _                   -> "Invalid Cookie"
-
-optionalWordpressConfig :: Config -> WordpressAuthConfig (Maybe (Entity User))
-optionalWordpressConfig c = WordpressAuthConfig
-    { cookieName              = defaultCookieName $ wpSiteUrl c
-    , getUserData = fmap (fmap (\(x, y, z) -> (Just x, y, z))) . fetchUserData c
-    , loggedInKey             = wpLoggedInKey c
-    , loggedInSalt            = wpLoggedInSalt c
-    , onAuthenticationFailure = const (return $ WordpressUserData Nothing)
-    }
-
-fetchUserData
-    :: Config
-    -> Text
-    -> Handler (Maybe (Entity User, Text, [(Text, POSIXTime)]))
-fetchUserData c userName = flip runReaderT c . runDB $ do
-    maybeUser <- selectFirst [UserLogin ==. userName] []
-    case maybeUser of
-        Just e  -> Just <$> getSessionTokens e
-        Nothing -> return Nothing
-  where
+    fetchUserData
+        :: Text -> Handler (Maybe (Entity User, Text, [(Text, POSIXTime)]))
+    fetchUserData userName = flip runReaderT c . runDB $ do
+        maybeUser <- selectFirst [UserLogin ==. userName] []
+        case maybeUser of
+            Just e  -> Just <$> getSessionTokens e
+            Nothing -> return Nothing
     getSessionTokens e@(Entity userId user) = do
         tokenMeta <- selectFirst
             [UserMetaUser ==. userId, UserMetaKey ==. "session_tokens"]
@@ -120,6 +107,9 @@ fetchUserData c userName = flip runReaderT c . runDB $ do
         return (e, userPassword user, maybe [] metaToTokenList tokenMeta)
     metaToTokenList =
         entityVal .> userMetaValue .> fromMaybe "" .> decodeSessionTokens
+
+optionalWordpressConfig :: Config -> WordpressAuthConfig (Maybe (Entity User))
+optionalWordpressConfig = optionalWordpressAuth . wordpressConfig
 
 
 -- brittany-disable-next-binding
@@ -130,10 +120,9 @@ context
              ]
 context = Proxy
 
-
-
 api :: Proxy API
 api = Proxy
+
 
 -- brittany-disable-next-binding
 type API =

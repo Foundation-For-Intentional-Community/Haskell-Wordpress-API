@@ -26,13 +26,15 @@ You must define the create `ServerData` type instance yourself:
 TODO: Validate the REST nonce as well
 TODO: Implement `auth` & `auth_sec` schemes for wp-admin? Both the
       logged_in & auth/auth_sec cookies are sent in admin requests. Do
-      admin routes check both or something? Ask in #wordpress
+      admin routes check both or something? Ask in #wordpress? Preliminary
+      tests say requests to `wp-json` just get `logged_in`.
 TODO: Allow dynamic generation of CookieName by replacing WPConfig field w/
       `IO CookieName` or `Handler CookieName`. This would allow querying
       the database for the siteurl instead of hardcoding it.
 -}
 module WordpressAuth
     ( WordpressAuthConfig(..)
+    , optionalWordpressAuth
     , WordpressUserData(..)
     , WordpressAuthError(..)
     , authHandler
@@ -102,6 +104,14 @@ data WordpressAuthConfig a
         , onAuthenticationFailure :: WordpressAuthError -> Handler (WordpressUserData a)
         -- ^ Function to run when authentication validation fails.
         }
+
+-- | Wrap the UserData in a Maybe, returning Nothing on validation failure.
+optionalWordpressAuth :: WordpressAuthConfig a -> WordpressAuthConfig (Maybe a)
+optionalWordpressAuth wpConfig = wpConfig
+    { getUserData             = fmap (fmap (\(x, y, z) -> (Just x, y, z)))
+                                    . getUserData wpConfig
+    , onAuthenticationFailure = const (return $ WordpressUserData Nothing)
+    }
 
 -- | This represents some arbitrary data passed to your route on successful
 -- authentication, e.g. your User model or the user's ID.
