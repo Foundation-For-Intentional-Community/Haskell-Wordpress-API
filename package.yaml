@@ -3,7 +3,8 @@ version:             0.1.0.0
 synopsis:            A REST API interfacing with Wordpress Datbase & Authentication.
 #description:
 homepage:            https://github.com/Fellowship-For-Intentional-Community/Haskell-Wordpress-API#readme
-license:             GPL-3.0
+github:              Fellowship-For-Intentional-Community/Haskell-Wordpress-API
+license:             GPL-3
 author:              Pavan Rikhi
 maintainer:          pavan.rikhi@gmail.com
 copyright:           FIC, 2018
