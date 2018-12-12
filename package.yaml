@@ -35,6 +35,7 @@ library:
     - cryptohash-md5
     - cryptohash-sha256
     - hs-php-session
+    - network-uri
     - persistent
     - persistent-template
     - resource-pool

@@ -27,6 +27,10 @@ data Config
         -- ^ The LOGGED_IN_KEY for the Wordpress site.
         , wpLoggedInSalt :: Text
         -- ^ The LOGGED_IN_SALT for the Wordpress site.
+        , wpNonceKey :: Text
+        -- ^ The NONCE_KEY for the Wordpress site.
+        , wpNonceSalt :: Text
+        -- ^ The NONCE_SALT for the Wordpress site.
         }
 
 -- | Run a database acton in a route handler.

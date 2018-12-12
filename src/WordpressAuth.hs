@@ -23,10 +23,9 @@ You must define the create `ServerData` type instance yourself:
 > type instance AuthServerData (AuthProtect "wp") = Entity User
 
 
-TODO: Validate the REST nonce as well
-        - how to handle anonymous case? No cookie, but nonce.
-          Maybe bring back UserData type as union of authed/anonymous with
-          userdata on auth branch only
+TODO: Handle validation of anonymous nonces where there's  no cookie.
+      Maybe bring back UserData type as union of authed/anonymous with
+      userdata on auth branch only.
 TODO: Implement `auth` & `auth_sec` schemes for wp-admin? Both the
       logged_in & auth/auth_sec cookies are sent in admin requests. Do
       admin routes check both or something? Ask in #wordpress? Preliminary
@@ -48,8 +47,10 @@ module WordpressAuth
     )
 where
 
+import           Control.Applicative            ( (<|>) )
 import           Control.Monad                  ( (<=<)
                                                 , unless
+                                                , join
                                                 )
 import           Control.Monad.Except           ( MonadError
                                                 , ExceptT
@@ -65,6 +66,7 @@ import           Data.Maybe                     ( mapMaybe
 import           Data.PHPSession                ( PHPSessionValue(..)
                                                 , decodePHPSessionValue
                                                 )
+import           Data.Ratio                     ( (%) )
 import           Data.Text                      ( Text )
 import           Data.Text.Encoding             ( encodeUtf8
                                                 , decodeUtf8
@@ -76,6 +78,7 @@ import           Flow
 import           Network.URI.Encode             ( decodeText )
 import           Network.Wai                    ( Request
                                                 , requestHeaders
+                                                , queryString
                                                 )
 import           Servant                        ( Handler )
 import           Servant.Server.Experimental.Auth
@@ -102,8 +105,12 @@ data WordpressAuthConfig a
         -- ^ The LOGGED_IN_KEY from wp-config.php
         , loggedInSalt :: Text
         -- ^ The LOGGED_IN_SALT from wp-config.php
-        , getUserData :: Text -> Handler (Maybe (a, Text, [(Text, POSIXTime)]))
-        -- ^ Function for fetching the User's Data, Password, & Session
+        , nonceKey :: Text
+        -- ^ The NONCE_KEY from wp-config.php
+        , nonceSalt :: Text
+        -- ^ The NONCE_SALT from wp-config.php
+        , getUserData :: Text -> Handler (Maybe (a, Integer, Text, [(Text, POSIXTime)]))
+        -- ^ Function for fetching the User's Data, ID, Password, & Session
         -- Tokens from the `user_login` in the Cookie.
         , onAuthenticationFailure :: WordpressAuthError -> Handler a
         -- ^ Function to run when authentication validation fails.
@@ -112,7 +119,7 @@ data WordpressAuthConfig a
 -- | Wrap the UserData in a Maybe, returning Nothing on validation failure.
 optionalWordpressAuth :: WordpressAuthConfig a -> WordpressAuthConfig (Maybe a)
 optionalWordpressAuth wpConfig = wpConfig
-    { getUserData             = fmap (fmap (\(x, y, z) -> (Just x, y, z)))
+    { getUserData             = fmap (fmap (\(w, x, y, z) -> (Just w, x, y, z)))
                                     . getUserData wpConfig
     , onAuthenticationFailure = const (return Nothing)
     }
@@ -133,26 +140,48 @@ data WordpressAuthError
     -- ^ The HMAC hash in the Cookie couldn't be validated.
     | InvalidToken
     -- ^ The session token in the Cookie couldn't be validated.
+    | NoNonce
+    -- ^ The `Request` has no `X-WP-Nonce` header.
+    | EmptyNonce
+    -- ^ The nonce header was empty.
+    | InvalidNonce
+    -- ^ The nonce couldn't be validated.
 
 
--- | Expect Wordpress's `LOGGED_IN_COOKIE`, returning the UserData if it is
--- valid, or throwing a 401 error otherwise.
+-- | Expect Wordpress's `LOGGED_IN` cookie & `wp_rest` nonce, returning the
+-- UserData if they are valid, or throwing a 401 error otherwise.
+--
+-- The nonce may be passed via the `X-WP-Nonce` header or `_wpnonce` query
+-- parameter.
 authHandler :: forall a . WordpressAuthConfig a -> AuthHandler Request a
 authHandler wpConfig = mkAuthHandler handler
   where
     handler :: Request -> Handler a
     handler req =
         either (onAuthenticationFailure wpConfig) return <=< runExceptT $ do
-            cookieHeader <- lookup "cookie" (requestHeaders req)
-                |> liftMaybe NoCookieHeader
-            cookieText <-
+            let headers = requestHeaders req
+            cookieHeader <- lookup "cookie" headers |> liftMaybe NoCookieHeader
+            cookieText   <-
                 parseCookiesText cookieHeader
                 |> lookup (fromCookieName $ cookieName wpConfig)
                 |> fmap decodeText
                 |> liftMaybe NoCookieMatches
             wpCookie <- parseWordpressCookie cookieText
                 |> liftMaybe CookieParsingFailed
-            validateWordpressCookie wpConfig wpCookie
+            (userData, userId) <- validateWordpressCookie wpConfig wpCookie
+            nonce <- (lookup "x-wp-nonce" headers <|> nonceQuery req)
+                |> liftMaybe NoNonce
+            tick <- liftIO wordpressNonceTick
+            let nonceIsValid = validateWordpressNonce wpConfig
+                                                      wpCookie
+                                                      tick
+                                                      userId
+                                                      "wp_rest"
+                                                      (decodeUtf8 nonce)
+            unless nonceIsValid $ throwError InvalidNonce
+            return userData
+    nonceQuery :: Request -> Maybe B.ByteString
+    nonceQuery = queryString .> lookup "_wpnonce" .> join
     liftMaybe :: MonadError e m => e -> Maybe x -> m x
     liftMaybe a = liftEither . maybeToEither a
     maybeToEither :: e -> Maybe x -> Either e x
@@ -184,37 +213,35 @@ parseWordpressCookie rawCookie = case T.splitOn "|" rawCookie of
 validateWordpressCookie
     :: WordpressAuthConfig a
     -> WPCookie
-    -> ExceptT WordpressAuthError Handler a
+    -> ExceptT WordpressAuthError Handler (a, Integer)
 validateWordpressCookie wpConfig wpCookie = do
     currentTime <- liftIO getPOSIXTime
     if currentTime > expiration wpCookie
         then throwError CookieExpired
         else (username wpCookie |> getUserData wpConfig .> lift) >>= \case
             Nothing -> throwError UserDataNotFound
-            Just (userData, userPass, sessionTokens) -> do
+            Just (userData, userId, userPass, sessionTokens) -> do
                 let validHash = validateHash wpConfig wpCookie userPass
                     validSessionToken =
                         validateSessionToken currentTime wpCookie sessionTokens
                 unless validHash $ throwError InvalidHash
                 unless validSessionToken $ throwError InvalidToken
-                return userData
+                return (userData, userId)
 
 -- | Ensure the Cookie's hash matches the salted & hashed password & token.
 validateHash :: WordpressAuthConfig a -> WPCookie -> Text -> Bool
 validateHash wpConfig wpCookie userPass =
     let passFragment = T.drop 8 userPass |> T.take 4
         key =
-                T.intercalate
-                        "|"
+                joinHashParts
                         [ username wpCookie
                         , passFragment
                         , posixText $ expiration wpCookie
                         , token wpCookie
                         ]
-                    |> wordpressHash wpConfig
+                    |> wordpressHash wpConfig LoggedInScheme
         hash =
-                T.intercalate
-                        "|"
+                joinHashParts
                         [ username wpCookie
                         , posixText $ expiration wpCookie
                         , token wpCookie
@@ -225,8 +252,8 @@ validateHash wpConfig wpCookie userPass =
     posixText :: POSIXTime -> Text
     posixText t = T.pack $ show (floor t :: Integer)
 
--- Ensure the SHA256 hash of the Cookie's token matches one of the User's
--- unexpired session tokens.
+-- | Determine if the SHA256 hash of the Cookie's token matches one of the
+-- User's unexpired session tokens.
 validateSessionToken :: POSIXTime -> WPCookie -> [(Text, POSIXTime)] -> Bool
 validateSessionToken currentTime wpCookie sessionTokens =
     let hashedCookieToken = hashText SHA256.hash $ token wpCookie
@@ -234,17 +261,65 @@ validateSessionToken currentTime wpCookie sessionTokens =
             |> lookup hashedCookieToken
             |> isJust
 
+-- | Determine if the hash of the tick & token matches the current or
+-- previous ticks' hash.
+validateWordpressNonce
+    :: WordpressAuthConfig a
+    -> WPCookie
+    -> Integer
+    -> Integer
+    -> Text
+    -> Text
+    -> Bool
+validateWordpressNonce wpConfig cookie tick userId action nonce =
+    let
+        thisCycleHash =
+            joinHashParts
+                    [ T.pack $ show tick
+                    , action
+                    , T.pack $ show userId
+                    , token cookie
+                    ]
+                |> hashAndTrim
+        lastCycleHash =
+            joinHashParts
+                    [ T.pack $ show $ tick - 1
+                    , action
+                    , T.pack $ show userId
+                    , token cookie
+                    ]
+                |> hashAndTrim
+    in
+        nonce /= "" && nonce `elem` [thisCycleHash, lastCycleHash]
+  where
+    hashAndTrim s =
+        let hashed = wordpressHash wpConfig NonceScheme s
+        in  T.drop (T.length hashed - 12) hashed |> T.take 10
+
+data AuthScheme
+    = LoggedInScheme
+    | NonceScheme
+
 -- | Port of wp_hash function. The returned Text is a hex representation of
 -- an MD5 HMAC with loggedInKey & loggedInSalt.
-wordpressHash :: WordpressAuthConfig a -> Text -> Text
-wordpressHash wpConfig textToHash =
-    let salt = wordpressSalt wpConfig in hmacText MD5.hmac salt textToHash
+wordpressHash :: WordpressAuthConfig a -> AuthScheme -> Text -> Text
+wordpressHash wpConfig authScheme textToHash =
+    let salt = wordpressSalt wpConfig authScheme
+    in  hmacText MD5.hmac salt textToHash
 
 -- | Port of wp_salt function. Builds the salt for the logged_in auth
 -- scheme by concatenating the key & salt.
-wordpressSalt :: WordpressAuthConfig a -> Text
-wordpressSalt WordpressAuthConfig { loggedInKey, loggedInSalt } =
-    loggedInKey <> loggedInSalt
+wordpressSalt :: WordpressAuthConfig a -> AuthScheme -> Text
+wordpressSalt WordpressAuthConfig {..} = \case
+    LoggedInScheme -> loggedInKey <> loggedInSalt
+    NonceScheme    -> nonceKey <> nonceSalt
+
+-- | Port of wp_nonce_tick.
+wordpressNonceTick :: IO Integer
+wordpressNonceTick = do
+    let nonceLifetime = 60 * 60 * 24 :: Integer        -- TODO: Pull into config
+    time <- getPOSIXTime
+    return $ ceiling $ fromInteger (floor time) / (nonceLifetime % 2)
 
 -- | Decode a serialized array containing a User's Session Tokens, usually
 -- stored as the `session_tokens` usermeta.
@@ -288,6 +363,11 @@ hmacText hasher key =
 -- | Apply a hashing function to Text values.
 hashText :: (B.ByteString -> B.ByteString) -> Text -> Text
 hashText hasher = encodeUtf8 .> hasher .> Base16.encode .> decodeUtf8
+
+-- | Join the different text to hash together by `|` like Wordpress
+-- expects.
+joinHashParts :: [Text] -> Text
+joinHashParts = T.intercalate "|"
 
 
 -- Auth Configuration

@@ -17,6 +17,8 @@ export DB_PASS="<database password>"
 
 export LOGGED_IN_KEY="<wp-config logged_in_key >"
 export LOGGED_IN_SALT="<wp-config logged_in_salt >"
+export NONCE_KEY="<wp-config nonce_key >"
+export NONCE_SALT="<wp-config nonce_salt >"
 
 export SITE_URL="<wp-options siteurl>"
 ```

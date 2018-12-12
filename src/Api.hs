@@ -83,6 +83,8 @@ wordpressConfig c = WordpressAuthConfig
     , getUserData             = fetchUserData
     , loggedInKey             = wpLoggedInKey c
     , loggedInSalt            = wpLoggedInSalt c
+    , nonceKey                = wpNonceKey c
+    , nonceSalt               = wpNonceSalt c
     , onAuthenticationFailure = replyWith401
     }
   where
@@ -91,9 +93,13 @@ wordpressConfig c = WordpressAuthConfig
         NoCookieHeader      -> "Missing Cookie"
         NoCookieMatches     -> "Missing Cookie"
         CookieParsingFailed -> "Malformed Cookie"
+        NoNonce             -> "Missing Nonce"
+        EmptyNonce          -> "Missing Nonce"
+        InvalidNonce        -> "Invalid Nonce"
         _                   -> "Invalid Cookie"
     fetchUserData
-        :: Text -> Handler (Maybe (Entity User, Text, [(Text, POSIXTime)]))
+        :: Text
+        -> Handler (Maybe (Entity User, Integer, Text, [(Text, POSIXTime)]))
     fetchUserData userName = flip runReaderT c . runDB $ do
         maybeUser <- selectFirst [UserLogin ==. userName] []
         case maybeUser of
@@ -103,7 +109,12 @@ wordpressConfig c = WordpressAuthConfig
         tokenMeta <- selectFirst
             [UserMetaUser ==. userId, UserMetaKey ==. "session_tokens"]
             []
-        return (e, userPassword user, maybe [] metaToTokenList tokenMeta)
+        return
+            ( e
+            , fromIntegral $ fromSqlKey userId
+            , userPassword user
+            , maybe [] metaToTokenList tokenMeta
+            )
     metaToTokenList =
         entityVal .> userMetaValue .> fromMaybe "" .> decodeSessionTokens
 

@@ -33,6 +33,8 @@ main = do
     wpSiteUrl      <- textEnv "SITE_URL"
     wpLoggedInKey  <- textEnv "LOGGED_IN_KEY"
     wpLoggedInSalt <- textEnv "LOGGED_IN_SALT"
+    wpNonceKey     <- textEnv "NONCE_KEY"
+    wpNonceSalt    <- textEnv "NONCE_SALT"
     runStderrLoggingT $ withMySQLPool dbInfo 20 $ \dbPool ->
         liftIO <. runSettings settings <| app Config { .. }
   where
