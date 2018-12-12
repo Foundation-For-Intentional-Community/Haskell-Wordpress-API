@@ -20,10 +20,13 @@ this would be your User type or the User's ID.
 
 You must define the create `ServerData` type instance yourself:
 
-> type instance AuthServerData (AuthProtect "wp") = WordpressUesrData (Entity User)
+> type instance AuthServerData (AuthProtect "wp") = Entity User
 
 
 TODO: Validate the REST nonce as well
+        - how to handle anonymous case? No cookie, but nonce.
+          Maybe bring back UserData type as union of authed/anonymous with
+          userdata on auth branch only
 TODO: Implement `auth` & `auth_sec` schemes for wp-admin? Both the
       logged_in & auth/auth_sec cookies are sent in admin requests. Do
       admin routes check both or something? Ask in #wordpress? Preliminary
@@ -31,11 +34,12 @@ TODO: Implement `auth` & `auth_sec` schemes for wp-admin? Both the
 TODO: Allow dynamic generation of CookieName by replacing WPConfig field w/
       `IO CookieName` or `Handler CookieName`. This would allow querying
       the database for the siteurl instead of hardcoding it.
+TODO: Move to 2 libraries, splitting off servant specifics. Support both Wai
+      Request & Network.HTTP Request types via typeclass?
 -}
 module WordpressAuth
     ( WordpressAuthConfig(..)
     , optionalWordpressAuth
-    , WordpressUserData(..)
     , WordpressAuthError(..)
     , authHandler
     , CookieName(..)
@@ -101,7 +105,7 @@ data WordpressAuthConfig a
         , getUserData :: Text -> Handler (Maybe (a, Text, [(Text, POSIXTime)]))
         -- ^ Function for fetching the User's Data, Password, & Session
         -- Tokens from the `user_login` in the Cookie.
-        , onAuthenticationFailure :: WordpressAuthError -> Handler (WordpressUserData a)
+        , onAuthenticationFailure :: WordpressAuthError -> Handler a
         -- ^ Function to run when authentication validation fails.
         }
 
@@ -110,13 +114,8 @@ optionalWordpressAuth :: WordpressAuthConfig a -> WordpressAuthConfig (Maybe a)
 optionalWordpressAuth wpConfig = wpConfig
     { getUserData             = fmap (fmap (\(x, y, z) -> (Just x, y, z)))
                                     . getUserData wpConfig
-    , onAuthenticationFailure = const (return $ WordpressUserData Nothing)
+    , onAuthenticationFailure = const (return Nothing)
     }
-
--- | This represents some arbitrary data passed to your route on successful
--- authentication, e.g. your User model or the user's ID.
--- TODO: Do we really need this wrapper type?
-newtype WordpressUserData a = WordpressUserData { wordpressUserData :: a }
 
 -- | Potential errors that may occur during authentication.
 data WordpressAuthError
@@ -138,13 +137,10 @@ data WordpressAuthError
 
 -- | Expect Wordpress's `LOGGED_IN_COOKIE`, returning the UserData if it is
 -- valid, or throwing a 401 error otherwise.
-authHandler
-    :: forall u
-     . WordpressAuthConfig u
-    -> AuthHandler Request (WordpressUserData u)
+authHandler :: forall a . WordpressAuthConfig a -> AuthHandler Request a
 authHandler wpConfig = mkAuthHandler handler
   where
-    handler :: Request -> Handler (WordpressUserData u)
+    handler :: Request -> Handler a
     handler req =
         either (onAuthenticationFailure wpConfig) return <=< runExceptT $ do
             cookieHeader <- lookup "cookie" (requestHeaders req)
@@ -157,9 +153,9 @@ authHandler wpConfig = mkAuthHandler handler
             wpCookie <- parseWordpressCookie cookieText
                 |> liftMaybe CookieParsingFailed
             validateWordpressCookie wpConfig wpCookie
-    liftMaybe :: MonadError e m => e -> Maybe a -> m a
+    liftMaybe :: MonadError e m => e -> Maybe x -> m x
     liftMaybe a = liftEither . maybeToEither a
-    maybeToEither :: e -> Maybe a -> Either e a
+    maybeToEither :: e -> Maybe x -> Either e x
     maybeToEither e = maybe (Left e) Right
 
 
@@ -188,7 +184,7 @@ parseWordpressCookie rawCookie = case T.splitOn "|" rawCookie of
 validateWordpressCookie
     :: WordpressAuthConfig a
     -> WPCookie
-    -> ExceptT WordpressAuthError Handler (WordpressUserData a)
+    -> ExceptT WordpressAuthError Handler a
 validateWordpressCookie wpConfig wpCookie = do
     currentTime <- liftIO getPOSIXTime
     if currentTime > expiration wpCookie
@@ -201,7 +197,7 @@ validateWordpressCookie wpConfig wpCookie = do
                         validateSessionToken currentTime wpCookie sessionTokens
                 unless validHash $ throwError InvalidHash
                 unless validSessionToken $ throwError InvalidToken
-                return $ WordpressUserData userData
+                return userData
 
 -- | Ensure the Cookie's hash matches the salted & hashed password & token.
 validateHash :: WordpressAuthConfig a -> WPCookie -> Text -> Bool

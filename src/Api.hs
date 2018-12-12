@@ -65,16 +65,16 @@ server c = hoistServerWithContext api context (`runReaderT` c) routes
 serverContext
     :: Config
     -> Context
-            '[ AuthHandler Request (WordpressUserData (Entity User))
-             , AuthHandler Request (WordpressUserData (Maybe (Entity User)))
+            '[ AuthHandler Request (Entity User)
+             , AuthHandler Request (Maybe (Entity User))
              ]
 serverContext config =
        authHandler (wordpressConfig config)
     :. authHandler (optionalWordpressConfig config)
     :. EmptyContext
 
-type instance AuthServerData (AuthProtect "wordpress") = WordpressUserData (Entity User)
-type instance AuthServerData (AuthProtect "wordpress-optional") = WordpressUserData (Maybe (Entity User))
+type instance AuthServerData (AuthProtect "wordpress") = Entity User
+type instance AuthServerData (AuthProtect "wordpress-optional") = Maybe (Entity User)
 
 
 wordpressConfig :: Config -> WordpressAuthConfig (Entity User)
@@ -86,8 +86,7 @@ wordpressConfig c = WordpressAuthConfig
     , onAuthenticationFailure = replyWith401
     }
   where
-    replyWith401
-        :: WordpressAuthError -> Handler (WordpressUserData (Entity User))
+    replyWith401 :: WordpressAuthError -> Handler (Entity User)
     replyWith401 err = (\s -> throwError err401 { errBody = s }) $ case err of
         NoCookieHeader      -> "Missing Cookie"
         NoCookieMatches     -> "Missing Cookie"
@@ -115,8 +114,8 @@ optionalWordpressConfig = optionalWordpressAuth . wordpressConfig
 -- brittany-disable-next-binding
 context
     :: Proxy
-            '[ AuthHandler Request (WordpressUserData (Entity User))
-             , AuthHandler Request (WordpressUserData (Maybe (Entity User)))
+            '[ AuthHandler Request (Entity User)
+             , AuthHandler Request (Maybe (Entity User))
              ]
 context = Proxy
 
